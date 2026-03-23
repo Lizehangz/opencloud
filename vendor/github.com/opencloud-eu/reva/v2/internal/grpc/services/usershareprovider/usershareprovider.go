@@ -35,6 +35,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/opencloud-eu/reva/v2/pkg/appctx"
 	"github.com/opencloud-eu/reva/v2/pkg/conversions"
@@ -65,6 +66,7 @@ type config struct {
 	Drivers               map[string]map[string]interface{} `mapstructure:"drivers"`
 	GatewayAddr           string                            `mapstructure:"gateway_addr"`
 	AllowedPathsForShares []string                          `mapstructure:"allowed_paths_for_shares"`
+	MachineAuthAPIKey     string                            `mapstructure:"machine_auth_apikey"`
 }
 
 func (c *config) init() {
@@ -77,6 +79,7 @@ type service struct {
 	sm                    share.Manager
 	gatewaySelector       pool.Selectable[gateway.GatewayAPIClient]
 	allowedPathsForShares []*regexp.Regexp
+	machineAuthAPIKey     string
 }
 
 func getShareManager(c *config) (share.Manager, error) {
@@ -137,18 +140,43 @@ func NewDefault(m map[string]interface{}, ss *grpc.Server, _ *zerolog.Logger) (r
 		return nil, err
 	}
 
-	return New(gatewaySelector, sm, allowedPathsForShares), nil
+	return New(gatewaySelector, sm, allowedPathsForShares, c.MachineAuthAPIKey), nil
 }
 
 // New creates a new user share provider svc
-func New(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], sm share.Manager, allowedPathsForShares []*regexp.Regexp) rgrpc.Service {
+func New(gatewaySelector pool.Selectable[gateway.GatewayAPIClient], sm share.Manager, allowedPathsForShares []*regexp.Regexp, machineAuthAPIKey string) rgrpc.Service {
 	service := &service{
 		sm:                    sm,
 		gatewaySelector:       gatewaySelector,
 		allowedPathsForShares: allowedPathsForShares,
+		machineAuthAPIKey:     machineAuthAPIKey,
 	}
 
 	return service
+}
+
+func authContextForUser(client gateway.GatewayAPIClient, userID *userpb.UserId, machineAuthAPIKey string) (context.Context, error) {
+	if machineAuthAPIKey == "" {
+		return nil, errtypes.NotSupported("machine auth not configured")
+	}
+	if userID == nil || userID.GetOpaqueId() == "" {
+		return nil, errtypes.NotFound("user id missing")
+	}
+
+	authCtx := ctxpkg.ContextSetUser(context.Background(), &userpb.User{Id: userID})
+	authRes, err := client.Authenticate(authCtx, &gateway.AuthenticateRequest{
+		Type:         "machine",
+		ClientId:     "userid:" + userID.GetOpaqueId(),
+		ClientSecret: machineAuthAPIKey,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if authRes.GetStatus().GetCode() != rpc.Code_CODE_OK {
+		return nil, errtypes.NewErrtypeFromStatus(authRes.GetStatus())
+	}
+
+	return metadata.AppendToOutgoingContext(authCtx, ctxpkg.TokenHeader, authRes.GetToken()), nil
 }
 
 func (s *service) isPathAllowed(path string) bool {
@@ -600,6 +628,28 @@ func (s *service) setReceivedShareMountPoint(ctx context.Context, req *collabora
 		return resourceStat.GetStatus(), err
 	}
 
+	mountPath := resourceStat.GetInfo().GetName()
+	pathCtx := ctx
+	if ownerCtx, ownerErr := authContextForUser(gwc, resourceStat.GetInfo().GetOwner(), s.machineAuthAPIKey); ownerErr == nil {
+		pathCtx = ownerCtx
+	} else if ownerErr != nil {
+		appctx.GetLogger(ctx).Debug().Err(ownerErr).Msg("usershareprovider: failed to authenticate as resource owner, falling back to receiver context for mount path")
+	}
+
+	resourcePath, err := gwc.GetPath(pathCtx, &provider.GetPathRequest{
+		ResourceId: resourceStat.GetInfo().GetId(),
+	})
+	switch {
+	case err == nil && resourcePath.GetStatus().GetCode() == rpc.Code_CODE_OK:
+		if p := strings.TrimPrefix(filepath.Clean(resourcePath.GetPath()), "/"); p != "" && p != "." {
+			mountPath = p
+		}
+	case err != nil:
+		appctx.GetLogger(ctx).Debug().Err(err).Msg("usershareprovider: failed to resolve resource path, falling back to resource name")
+	case resourcePath.GetStatus().GetCode() != rpc.Code_CODE_OK:
+		appctx.GetLogger(ctx).Debug().Str("status", resourcePath.GetStatus().GetCode().String()).Msg("usershareprovider: resource path lookup did not succeed, falling back to resource name")
+	}
+
 	// handle mount point related updates
 	{
 		var userID *userpb.UserId
@@ -613,7 +663,7 @@ func (s *service) setReceivedShareMountPoint(ctx context.Context, req *collabora
 		// check if the requested mount point is available and if not, find a suitable one
 		availableMountpoint, _, err := getMountpointAndUnmountedShares(ctx, receivedShares, s.gatewaySelector, nil,
 			resourceStat.GetInfo().GetId(),
-			resourceStat.GetInfo().GetName(),
+			mountPath,
 		)
 		if err != nil {
 			return status.NewInternal(ctx, err.Error()), nil

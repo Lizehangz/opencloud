@@ -19,6 +19,16 @@ func SharingConfigFromStruct(cfg *config.Config, logger log.Logger) (map[string]
 		logger.Err(err).Send()
 		return nil, err
 	}
+	machineAuthAPIKey := cfg.UserSharingDrivers.JSONCS3.SystemUserAPIKey
+	if machineAuthAPIKey == "" {
+		machineAuthAPIKey = cfg.UserSharingDrivers.CS3.SystemUserAPIKey
+	}
+	if machineAuthAPIKey == "" {
+		machineAuthAPIKey = cfg.PublicSharingDrivers.JSONCS3.SystemUserAPIKey
+	}
+	if machineAuthAPIKey == "" {
+		machineAuthAPIKey = cfg.PublicSharingDrivers.CS3.SystemUserAPIKey
+	}
 	rcfg := map[string]interface{}{
 		"shared": map[string]interface{}{
 			"jwt_secret":                cfg.TokenManager.JWTSecret,
@@ -38,7 +48,8 @@ func SharingConfigFromStruct(cfg *config.Config, logger log.Logger) (map[string]
 			// TODO build services dynamically
 			"services": map[string]interface{}{
 				"usershareprovider": map[string]interface{}{
-					"driver": cfg.UserSharingDriver,
+					"driver":              cfg.UserSharingDriver,
+					"machine_auth_apikey": machineAuthAPIKey,
 					"drivers": map[string]interface{}{
 						"json": map[string]interface{}{
 							"file":         cfg.UserSharingDrivers.JSON.File,

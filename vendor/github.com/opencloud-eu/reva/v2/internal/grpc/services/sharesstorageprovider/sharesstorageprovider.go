@@ -20,8 +20,11 @@ package sharesstorageprovider
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/opencloud-eu/reva/v2/pkg/storagespace"
@@ -53,6 +56,7 @@ import (
 
 const (
 	_defaultSharesJailEtag = "DECAFC00FEE"
+	_virtualDirPrefix    = "virtual-dir:"
 )
 
 func init() {
@@ -299,41 +303,23 @@ func (s *service) InitiateFileUpload(ctx context.Context, req *provider.Initiate
 }
 
 func (s *service) GetPath(ctx context.Context, req *provider.GetPathRequest) (*provider.GetPathResponse, error) {
-	// TODO: Needs to find a path for a given resourceID
-	// It should
-	// - getPath of the resourceID - probably requires owner permissions -> needs machine auth
-	// - getPath of every received share on the same space - needs also owner permissions -> needs machine auth
-	// - find the shortest root path that is a prefix of the resource path
-	// alternatively implement this on storageprovider - it needs to know about grants to do so
-
 	if isShareJailRoot(req.ResourceId) {
-		return &provider.GetPathResponse{
-			Status: status.NewOK(ctx),
-			Path:   "/",
-		}, nil
+		return &provider.GetPathResponse{Status: status.NewOK(ctx), Path: "/"}, nil
+	}
+	if req.ResourceId != nil && strings.HasPrefix(req.ResourceId.GetOpaqueId(), _virtualDirPrefix) {
+		return &provider.GetPathResponse{Status: status.NewOK(ctx), Path: "/" + strings.TrimPrefix(req.ResourceId.GetOpaqueId(), _virtualDirPrefix)}, nil
 	}
 
-	receivedShare, rpcStatus, err := s.resolveAcceptedShare(ctx, &provider.Reference{
-		ResourceId: req.ResourceId,
-	})
-	appctx.GetLogger(ctx).Debug().
-		Interface("resourceId", req.ResourceId).
-		Interface("received_share", receivedShare).
-		Msg("sharesstorageprovider: Got GetPath request")
+	receivedShare, rpcStatus, err := s.resolveAcceptedShare(ctx, &provider.Reference{ResourceId: req.ResourceId})
+	appctx.GetLogger(ctx).Debug().Interface("resourceId", req.ResourceId).Interface("received_share", receivedShare).Msg("sharesstorageprovider: Got GetPath request")
 	if err != nil {
 		return nil, err
 	}
 	if rpcStatus.Code != rpc.Code_CODE_OK {
-		return &provider.GetPathResponse{
-			Status: rpcStatus,
-		}, nil
+		return &provider.GetPathResponse{Status: rpcStatus}, nil
 	}
 
-	return &provider.GetPathResponse{
-		Status: status.NewOK(ctx),
-		Path:   filepath.Clean("/" + receivedShare.MountPoint.Path),
-	}, nil
-
+	return &provider.GetPathResponse{Status: status.NewOK(ctx), Path: filepath.Clean("/" + receivedShare.MountPoint.Path)}, nil
 }
 
 func (s *service) GetHome(ctx context.Context, req *provider.GetHomeRequest) (*provider.GetHomeResponse, error) {
@@ -426,17 +412,9 @@ func (s *service) ListStorageSpaces(ctx context.Context, req *provider.ListStora
 				OpaqueId:  utils.ShareStorageSpaceID,
 			}
 			if spaceID == nil || isShareJailRoot(spaceID) {
-				earliestShare := findEarliestShare(receivedShares, shareInfo)
+				etag, mtime := directoryState("", receivedShares, shareInfo)
 				var opaque *typesv1beta1.Opaque
-				var mtime *typesv1beta1.Timestamp
-				if earliestShare != nil {
-					if info, ok := shareInfo[earliestShare.GetId().GetOpaqueId()]; ok {
-						mtime = info.Mtime
-						opaque = utils.AppendPlainToOpaque(opaque, "etag", info.Etag)
-					}
-				} else {
-					opaque = utils.AppendPlainToOpaque(opaque, "etag", _defaultSharesJailEtag)
-				}
+				opaque = utils.AppendPlainToOpaque(opaque, "etag", etag)
 				// only display the shares jail if we have accepted shares
 				opaque = utils.AppendPlainToOpaque(opaque, "spaceAlias", "virtual/shares")
 				space := &provider.StorageSpace{
@@ -723,66 +701,40 @@ func (s *service) Stat(ctx context.Context, req *provider.StatRequest) (*provide
 		if err != nil {
 			return nil, err
 		}
-		earliestShare := findEarliestShare(receivedShares, shareMd)
-		var mtime *typesv1beta1.Timestamp
-		etag := _defaultSharesJailEtag
-		if earliestShare != nil {
-			if info, ok := shareMd[earliestShare.GetId().GetOpaqueId()]; ok {
-				mtime = info.Mtime
-				etag = info.Etag
-			}
-		}
-		return &provider.StatResponse{
-			Status: status.NewOK(ctx),
-			Info: &provider.ResourceInfo{
-				Opaque: &typesv1beta1.Opaque{
-					Map: map[string]*typesv1beta1.OpaqueEntry{
-						"root": {
-							Decoder: "plain",
-							Value:   []byte(utils.ShareStorageProviderID),
-						},
-					},
-				},
-				Id: &provider.ResourceId{
-					StorageId: utils.ShareStorageProviderID,
-					SpaceId:   utils.ShareStorageSpaceID,
-					OpaqueId:  utils.ShareStorageSpaceID,
-				},
-				Type:          provider.ResourceType_RESOURCE_TYPE_CONTAINER,
-				Mtime:         mtime,
-				Path:          "/",
-				MimeType:      "httpd/unix-directory",
-				Size:          0,
-				PermissionSet: &provider.ResourcePermissions{
-					// TODO
-				},
-				Space: &provider.StorageSpace{
-					SpaceType: "virtual",
-				},
-				Etag:  etag,
-				Owner: owner.Id,
-			},
-		}, nil
+		etag, mtime := directoryState("", receivedShares, shareMd)
+		return &provider.StatResponse{Status: status.NewOK(ctx), Info: &provider.ResourceInfo{Opaque: &typesv1beta1.Opaque{Map: map[string]*typesv1beta1.OpaqueEntry{"root": {Decoder: "plain", Value: []byte(utils.ShareStorageProviderID)}}}, Id: &provider.ResourceId{StorageId: utils.ShareStorageProviderID, SpaceId: utils.ShareStorageSpaceID, OpaqueId: utils.ShareStorageSpaceID}, Type: provider.ResourceType_RESOURCE_TYPE_CONTAINER, Mtime: mtime, Path: "/", MimeType: "httpd/unix-directory", Size: 0, PermissionSet: &provider.ResourcePermissions{}, Space: &provider.StorageSpace{SpaceType: "virtual"}, Etag: etag, Owner: owner.Id}}, nil
 	}
+
+	if req.Ref != nil && req.Ref.ResourceId != nil && strings.HasPrefix(req.Ref.ResourceId.GetOpaqueId(), _virtualDirPrefix) {
+		owner, _ := ctxpkg.ContextGetUser(ctx)
+		receivedShares, shareMd, err := s.fetchAcceptedShares(ctx, req.Opaque, req.ArbitraryMetadataKeys, req.FieldMask)
+		if err != nil {
+			return nil, err
+		}
+		return &provider.StatResponse{Status: status.NewOK(ctx), Info: virtualDirResourceInfo(strings.TrimPrefix(req.Ref.ResourceId.GetOpaqueId(), _virtualDirPrefix), owner.GetId(), receivedShares, shareMd)}, nil
+	}
+
+	if req.Ref != nil && req.Ref.Path != "" && req.Ref.Path != "." && req.Ref.Path != "./" {
+		receivedShares, shareMd, err := s.fetchAcceptedShares(ctx, req.Opaque, req.ArbitraryMetadataKeys, req.FieldMask)
+		if err != nil {
+			return nil, err
+		}
+		if hasVirtualDir(req.Ref.Path, receivedShares) {
+			owner, _ := ctxpkg.ContextGetUser(ctx)
+			return &provider.StatResponse{Status: status.NewOK(ctx), Info: virtualDirResourceInfo(req.Ref.Path, owner.GetId(), receivedShares, shareMd)}, nil
+		}
+	}
+
 	receivedShare, rpcStatus, err := s.resolveAcceptedShare(ctx, req.Ref)
-	appctx.GetLogger(ctx).Debug().
-		Interface("ref", req.Ref).
-		Interface("received_share", receivedShare).
-		Err(err).
-		Msg("sharesstorageprovider: Got Stat request")
+	appctx.GetLogger(ctx).Debug().Interface("ref", req.Ref).Interface("received_share", receivedShare).Err(err).Msg("sharesstorageprovider: Got Stat request")
 	if err != nil {
 		return nil, err
 	}
 	if rpcStatus.Code != rpc.Code_CODE_OK {
-		return &provider.StatResponse{
-			Status: rpcStatus,
-		}, nil
+		return &provider.StatResponse{Status: rpcStatus}, nil
 	}
 	if receivedShare.State != collaboration.ShareState_SHARE_STATE_ACCEPTED {
-		return &provider.StatResponse{
-			Status: &rpc.Status{Code: rpc.Code_CODE_NOT_FOUND},
-			// not mounted yet
-		}, nil
+		return &provider.StatResponse{Status: &rpc.Status{Code: rpc.Code_CODE_NOT_FOUND}}, nil
 	}
 
 	gatewayClient, err := s.gatewaySelector.Next()
@@ -790,28 +742,16 @@ func (s *service) Stat(ctx context.Context, req *provider.StatRequest) (*provide
 		return nil, err
 	}
 
-	statRes, err := gatewayClient.Stat(ctx, &provider.StatRequest{
-		Opaque:                req.Opaque,
-		Ref:                   buildReferenceInShare(req.Ref, receivedShare),
-		ArbitraryMetadataKeys: req.ArbitraryMetadataKeys,
-	})
+	statRes, err := gatewayClient.Stat(ctx, &provider.StatRequest{Opaque: req.Opaque, Ref: buildReferenceInShare(req.Ref, receivedShare), ArbitraryMetadataKeys: req.ArbitraryMetadataKeys})
 	if err != nil {
 		return nil, err
 	}
-
-	// when stating a share jail mountpoint we need to rewrite the ids
 	if statRes.GetStatus().GetCode() == rpc.Code_CODE_OK && receivedShare.MountPoint.Path == strings.TrimPrefix(req.Ref.Path, "./") && statRes.Info != nil {
-		// overwrite id with the share jail mountpoint id
-		statRes.Info.Id = &provider.ResourceId{
-			StorageId: utils.ShareStorageProviderID,
-			SpaceId:   utils.ShareStorageSpaceID,
-			OpaqueId:  receivedShare.GetShare().GetId().GetOpaqueId(),
-		}
-		// overwrite parent id with the share jail root
-		statRes.Info.ParentId = &provider.ResourceId{
-			StorageId: utils.ShareStorageProviderID,
-			SpaceId:   utils.ShareStorageSpaceID,
-			OpaqueId:  utils.ShareStorageSpaceID,
+		statRes.Info.Id = &provider.ResourceId{StorageId: utils.ShareStorageProviderID, SpaceId: utils.ShareStorageSpaceID, OpaqueId: receivedShare.GetShare().GetId().GetOpaqueId()}
+		parent := shareJailParentPath(receivedShare.MountPoint.Path)
+		statRes.Info.ParentId = &provider.ResourceId{StorageId: utils.ShareStorageProviderID, SpaceId: utils.ShareStorageSpaceID, OpaqueId: utils.ShareStorageSpaceID}
+		if parent != "" {
+			statRes.Info.ParentId = virtualDirResourceID(parent)
 		}
 	}
 
@@ -822,86 +762,45 @@ func (s *service) ListContainerStream(req *provider.ListContainerStreamRequest, 
 	return gstatus.Errorf(codes.Unimplemented, "method not implemented")
 }
 func (s *service) ListContainer(ctx context.Context, req *provider.ListContainerRequest) (*provider.ListContainerResponse, error) {
-	if isVirtualRoot(req.Ref) {
-		// The root is empty, it is filled by mountpoints
-		// so, when accessing the root via /dav/spaces, we need to list the accepted shares with their mountpoint
-
+	basePath := ""
+	isVirtualDir := false
+	if req.Ref != nil && req.Ref.ResourceId != nil && strings.HasPrefix(req.Ref.ResourceId.GetOpaqueId(), _virtualDirPrefix) {
+		basePath = strings.TrimPrefix(req.Ref.ResourceId.GetOpaqueId(), _virtualDirPrefix)
+		isVirtualDir = true
+	}
+	if isVirtualRoot(req.Ref) || isVirtualDir {
+		owner, _ := ctxpkg.ContextGetUser(ctx)
 		receivedShares, shareMd, err := s.fetchAcceptedShares(ctx, req.Opaque, req.ArbitraryMetadataKeys, req.FieldMask)
 		if err != nil {
 			return nil, errors.Wrap(err, "sharesstorageprovider: error calling ListReceivedSharesRequest")
 		}
-
-		// Create map of shares that contains only the oldest share per shared resource. This is to avoid
-		// returning multiple resourceInfos for the same resource. But still be able to maintain a
-		// "somewhat" stable resourceID
-		oldestReceivedSharesByResourceID := make(map[string]*collaboration.ReceivedShare, len(receivedShares))
-		for _, receivedShare := range receivedShares {
-			if receivedShare.GetState() != collaboration.ShareState_SHARE_STATE_ACCEPTED {
-				continue
-			}
-			rIDStr := storagespace.FormatResourceID(receivedShare.GetShare().GetResourceId())
-			if oldest, ok := oldestReceivedSharesByResourceID[rIDStr]; ok {
-				// replace if older than current oldest
-				if utils.TSToTime(receivedShare.GetShare().GetCtime()).Before(utils.TSToTime(oldest.GetShare().GetCtime())) {
-					oldestReceivedSharesByResourceID[rIDStr] = receivedShare
-				}
-			} else {
-				oldestReceivedSharesByResourceID[rIDStr] = receivedShare
-			}
+		infos := findShareJailChildren(basePath, receivedShares, shareMd, owner.GetId())
+		return &provider.ListContainerResponse{Status: status.NewOK(ctx), Infos: infos}, nil
+	}
+	if req.Ref != nil && req.Ref.Path != "" && req.Ref.Path != "." && req.Ref.Path != "./" {
+		owner, _ := ctxpkg.ContextGetUser(ctx)
+		receivedShares, shareMd, err := s.fetchAcceptedShares(ctx, req.Opaque, req.ArbitraryMetadataKeys, req.FieldMask)
+		if err != nil {
+			return nil, errors.Wrap(err, "sharesstorageprovider: error calling ListReceivedSharesRequest")
 		}
-
-		// now compose the resourceInfos for the unified list of shares
-		infos := []*provider.ResourceInfo{}
-		for _, share := range oldestReceivedSharesByResourceID {
-			info := shareMd[share.GetShare().GetId().GetOpaqueId()]
-			if info == nil {
-				appctx.GetLogger(ctx).Debug().
-					Interface("share", share).
-					Msg("sharesstorageprovider: no resource info for share")
-				continue
-			}
-
-			// override resource id info
-			info.Id = &provider.ResourceId{
-				StorageId: utils.ShareStorageProviderID,
-				SpaceId:   utils.ShareStorageSpaceID,
-				OpaqueId:  share.GetShare().GetId().GetOpaqueId(),
-			}
-			info.Path = filepath.Base(share.MountPoint.Path)
-			info.Name = info.Path
-
-			infos = append(infos, info)
+		if hasVirtualDir(req.Ref.Path, receivedShares) {
+			infos := findShareJailChildren(req.Ref.Path, receivedShares, shareMd, owner.GetId())
+			return &provider.ListContainerResponse{Status: status.NewOK(ctx), Infos: infos}, nil
 		}
-		return &provider.ListContainerResponse{
-			Status: status.NewOK(ctx),
-			Infos:  infos,
-		}, nil
 	}
 	receivedShare, rpcStatus, err := s.resolveAcceptedShare(ctx, req.Ref)
-	appctx.GetLogger(ctx).Debug().
-		Interface("ref", req.Ref).
-		Interface("received_share", receivedShare).
-		Err(err).
-		Msg("sharesstorageprovider: Got ListContainer request")
+	appctx.GetLogger(ctx).Debug().Interface("ref", req.Ref).Interface("received_share", receivedShare).Err(err).Msg("sharesstorageprovider: Got ListContainer request")
 	if err != nil {
 		return nil, err
 	}
 	if rpcStatus.Code != rpc.Code_CODE_OK {
-		return &provider.ListContainerResponse{
-			Status: rpcStatus,
-		}, nil
+		return &provider.ListContainerResponse{Status: rpcStatus}, nil
 	}
-
 	gatewayClient, err := s.gatewaySelector.Next()
 	if err != nil {
 		return nil, err
 	}
-
-	return gatewayClient.ListContainer(ctx, &provider.ListContainerRequest{
-		Opaque:                req.Opaque,
-		Ref:                   buildReferenceInShare(req.Ref, receivedShare),
-		ArbitraryMetadataKeys: req.ArbitraryMetadataKeys,
-	})
+	return gatewayClient.ListContainer(ctx, &provider.ListContainerRequest{Opaque: req.Opaque, Ref: buildReferenceInShare(req.Ref, receivedShare), ArbitraryMetadataKeys: req.ArbitraryMetadataKeys})
 }
 func (s *service) ListFileVersions(ctx context.Context, req *provider.ListFileVersionsRequest) (*provider.ListFileVersionsResponse, error) {
 	receivedShare, rpcStatus, err := s.resolveAcceptedShare(ctx, req.Ref)
@@ -1143,6 +1042,9 @@ func (s *service) resolveAcceptedShare(ctx context.Context, ref *provider.Refere
 func isMountPointForPath(mountpoint, path string) bool {
 	requiredSegments := strings.Split(strings.TrimPrefix(mountpoint, "./"), "/")
 	pathSegments := strings.Split(strings.TrimPrefix(path, "./"), "/")
+	if len(pathSegments) < len(requiredSegments) {
+		return false
+	}
 	for i := range requiredSegments {
 		if pathSegments[i] != requiredSegments[i] {
 			return false
@@ -1331,6 +1233,178 @@ func buildReferenceInShare(ref *provider.Reference, s *collaboration.ReceivedSha
 		ResourceId: s.Share.ResourceId,
 		Path:       path,
 	}
+}
+
+
+func shareJailCleanPath(path string) string {
+	cleaned := strings.TrimPrefix(filepath.Clean("/"+path), "/")
+	if cleaned == "." {
+		return ""
+	}
+	return cleaned
+}
+
+func shareJailParentPath(path string) string {
+	cleaned := shareJailCleanPath(path)
+	if cleaned == "" {
+		return ""
+	}
+	parent := filepath.Dir(cleaned)
+	if parent == "." {
+		return ""
+	}
+	return shareJailCleanPath(parent)
+}
+
+func virtualDirResourceID(path string) *provider.ResourceId {
+	return &provider.ResourceId{
+		StorageId: utils.ShareStorageProviderID,
+		SpaceId:   utils.ShareStorageSpaceID,
+		OpaqueId:  _virtualDirPrefix + shareJailCleanPath(path),
+	}
+}
+
+func directoryState(path string, receivedShares []*collaboration.ReceivedShare, shareMd map[string]*provider.ResourceInfo) (string, *typesv1beta1.Timestamp) {
+	cleaned := shareJailCleanPath(path)
+	prefix := ""
+	if cleaned != "" {
+		prefix = cleaned + "/"
+	}
+	parts := make([]string, 0, len(receivedShares))
+	var latest *typesv1beta1.Timestamp
+	for _, share := range receivedShares {
+		if share.GetState() != collaboration.ShareState_SHARE_STATE_ACCEPTED {
+			continue
+		}
+		mountPath := shareJailCleanPath(share.GetMountPoint().GetPath())
+		if cleaned != "" && !strings.HasPrefix(mountPath, prefix) {
+			continue
+		}
+		info := shareMd[share.GetShare().GetId().GetOpaqueId()]
+		etag := share.GetShare().GetId().GetOpaqueId()
+		if info != nil && info.GetEtag() != "" {
+			etag = info.GetEtag()
+		}
+		parts = append(parts, mountPath+"|"+etag)
+		if info != nil && info.GetMtime() != nil {
+			if latest == nil || info.GetMtime().GetSeconds() > latest.GetSeconds() || (info.GetMtime().GetSeconds() == latest.GetSeconds() && info.GetMtime().GetNanos() > latest.GetNanos()) {
+				latest = info.GetMtime()
+			}
+		}
+	}
+	sort.Strings(parts)
+	h := sha1.Sum([]byte(strings.Join(parts, "\n")))
+	etag := _virtualDirPrefix + cleaned + ":" + hex.EncodeToString(h[:])
+	return etag, latest
+}
+
+func virtualDirResourceInfo(path string, owner *userv1beta1.UserId, receivedShares []*collaboration.ReceivedShare, shareMd map[string]*provider.ResourceInfo) *provider.ResourceInfo {
+	cleaned := shareJailCleanPath(path)
+	name := filepath.Base(cleaned)
+	parent := shareJailParentPath(cleaned)
+	etag, mtime := directoryState(cleaned, receivedShares, shareMd)
+	parentID := &provider.ResourceId{
+		StorageId: utils.ShareStorageProviderID,
+		SpaceId:   utils.ShareStorageSpaceID,
+		OpaqueId:  utils.ShareStorageSpaceID,
+	}
+	if parent != "" {
+		parentID = virtualDirResourceID(parent)
+	}
+	return &provider.ResourceInfo{
+		Opaque:         utils.AppendPlainToOpaque(nil, "etag", etag),
+		Id:             virtualDirResourceID(cleaned),
+		ParentId:       parentID,
+		Type:           provider.ResourceType_RESOURCE_TYPE_CONTAINER,
+		Path:           name,
+		Name:           name,
+		MimeType:       "httpd/unix-directory",
+		PermissionSet:  &provider.ResourcePermissions{},
+		Space:          &provider.StorageSpace{SpaceType: "virtual"},
+		Etag:           etag,
+		Mtime:          mtime,
+		Owner:          owner,
+	}
+}
+
+func hasVirtualDir(path string, receivedShares []*collaboration.ReceivedShare) bool {
+	cleaned := shareJailCleanPath(path)
+	if cleaned == "" {
+		return false
+	}
+	prefix := cleaned + "/"
+	for _, share := range receivedShares {
+		mountPath := shareJailCleanPath(share.GetMountPoint().GetPath())
+		if strings.HasPrefix(mountPath, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func findShareJailChildren(basePath string, receivedShares []*collaboration.ReceivedShare, shareMd map[string]*provider.ResourceInfo, owner *userv1beta1.UserId) []*provider.ResourceInfo {
+	basePath = shareJailCleanPath(basePath)
+	infosByName := map[string]*provider.ResourceInfo{}
+	for _, share := range receivedShares {
+		if share.GetState() != collaboration.ShareState_SHARE_STATE_ACCEPTED {
+			continue
+		}
+		mountPath := shareJailCleanPath(share.GetMountPoint().GetPath())
+		if mountPath == "" {
+			continue
+		}
+		rest := mountPath
+		if basePath != "" {
+			prefix := basePath + "/"
+			if !strings.HasPrefix(mountPath, prefix) {
+				continue
+			}
+			rest = strings.TrimPrefix(mountPath, prefix)
+		}
+		if rest == "" {
+			continue
+		}
+		parts := strings.Split(rest, "/")
+		name := parts[0]
+		if _, ok := infosByName[name]; ok {
+			continue
+		}
+		if len(parts) > 1 {
+			childPath := name
+			if basePath != "" {
+				childPath = basePath + "/" + name
+			}
+			infosByName[name] = virtualDirResourceInfo(childPath, owner, receivedShares, shareMd)
+			continue
+		}
+		info := shareMd[share.GetShare().GetId().GetOpaqueId()]
+		if info == nil {
+			continue
+		}
+		clone := *info
+		clone.Id = &provider.ResourceId{
+			StorageId: utils.ShareStorageProviderID,
+			SpaceId:   utils.ShareStorageSpaceID,
+			OpaqueId:  share.GetShare().GetId().GetOpaqueId(),
+		}
+		parent := shareJailParentPath(mountPath)
+		clone.ParentId = &provider.ResourceId{
+			StorageId: utils.ShareStorageProviderID,
+			SpaceId:   utils.ShareStorageSpaceID,
+			OpaqueId:  utils.ShareStorageSpaceID,
+		}
+		if parent != "" {
+			clone.ParentId = virtualDirResourceID(parent)
+		}
+		clone.Path = name
+		clone.Name = name
+		infosByName[name] = &clone
+	}
+	infos := make([]*provider.ResourceInfo, 0, len(infosByName))
+	for _, info := range infosByName {
+		infos = append(infos, info)
+	}
+	return infos
 }
 
 // isRename checks if the two references lie in the responsibility of the sharesstorageprovider and if a rename occurs
